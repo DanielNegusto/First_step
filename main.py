@@ -2,6 +2,10 @@ import json
 import pprint
 from typing import List, Optional
 
+import pandas as pd
+
+from src.reports import category_spending, spending_by_category
+from src.services import analyze_cashback, investment_bank, get_info_from_excel
 from src.utils import get_day_input, get_month_input, get_year_input, main_func, parse_user_date
 
 
@@ -23,8 +27,8 @@ def main() -> None:
     print("Привет! Добро пожаловать в программу работы с банковскими данными.")
     print("Выберите необходимый пункт меню:")
     print("1. Веб-Страницы")
-    print("2. Сервисы(не работает)")
-    print("3. Отчёты(не работает)")
+    print("2. Сервисы")
+    print("3. Отчёты")
 
     main_option = get_user_input("Введите номер: ", ["1", "2", "3"])
     if main_option == "1":
@@ -67,9 +71,47 @@ def main() -> None:
             print("Ваши данные по запросу -> ")
             pprint.pp(json.loads(result))
     elif main_option == "2":
-        print("В разработке.")
+        print("Введите дату для анализа данных")
+        year = get_year_input()
+        month = get_month_input()
+        df = get_info_from_excel()
+        print("Какие сервисы вы хотите использовать?")
+        print("1. Выгодные категории повышенного кешбэка")
+        print("2. Инвесткопилка")
+        option = get_user_input("Введите номер: ", ["1", "2"])
+        if option == "1":
+            print("Анализ выгодных категорий")
+            result = analyze_cashback(df, int(year), int(month))
+            print("Информация получена")
+            file_option = get_user_input("Сохранить файл(Да/Нет): ", ["ДА", "НЕТ"])
+            if file_option == "ДА":
+                save_result_to_file(result, "data/result.json")
+            print("Ваши данные по запросу -> ")
+            print(result)
+        elif option == "2":
+            limit = get_user_input("Введите порог округления: ", ["10", "50", "100"])
+            month = f"{year}-{month}"
+            result = investment_bank(month, df, int(limit))
+            print(round(result, 2))
     elif main_option == "3":
-        print("В разработке.")
+        print("Выбрано траты по категории")
+        data = get_info_from_excel()
+        df = pd.DataFrame(data)
+        df['Дата операции'] = pd.to_datetime(df['Дата операции'], dayfirst=True)
+        date_option = get_user_input("Выбрать текущую дату для анализа? (Да/Нет): ", ["ДА", "НЕТ"])
+        if date_option == "ДА":
+            found = category_spending(df)
+            result = spending_by_category(df, found)
+            print(result)
+        if date_option == "НЕТ":
+            print("Введите дату для анализа данных")
+            year = get_year_input()
+            month = get_month_input()
+            day = get_day_input()
+            date_str = f"{year}-{month}-{day}"
+            found = category_spending(df)
+            result = spending_by_category(df, found, date_str)
+            print(result)
 
 
 if __name__ == "__main__":
