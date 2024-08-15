@@ -1,17 +1,95 @@
+import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Dict, List, Tuple
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
+from tqdm import tqdm
 
-from src.views import (get_card_data_from_excel, get_card_from_main, get_currency_rates, get_expenses, get_greeting,
-                       get_income, get_stock_prices, get_top_transactions, load_user_settings, parse_date_range)
+from src.views import (get_card_data_from_excel, get_card_from_main, get_common_data, get_currency_rates, get_expenses,
+                       get_greeting, get_income, get_rates_and_prices, get_stock_prices, get_top_transactions,
+                       get_user_settings_data, load_user_settings, main_func, parse_date_range, process_events_data,
+                       process_home_data)
+
+
+def test_get_common_data() -> None:
+    start_date = datetime(2024, 8, 1)
+    end_date = datetime(2024, 8, 10)
+
+    mock_df: MagicMock = MagicMock()
+
+    with patch("src.views.get_card_data_from_excel", return_value=mock_df) as mock_get_card_data:
+        mock_progress_bar: MagicMock = MagicMock(spec=tqdm)
+
+        # Вызов функции с моками
+        result = get_common_data(start_date, end_date, mock_progress_bar)
+
+        # Проверка вызова get_card_data_from_excel с правильными аргументами
+        mock_get_card_data.assert_called_once_with("data/operations.xls", start_date=start_date, end_date=end_date)
+
+        # Проверка, что прогресс-бар был обновлен на 20
+        mock_progress_bar.update.assert_called_once_with(20)
+
+        # Проверка, что функция вернула ожидаемый DataFrame (или его мок)
+        assert result == mock_df
 
 
 def test_load_user_settings() -> None:
     with pytest.raises(FileNotFoundError):
         load_user_settings("not_found.xlsx")
+
+
+RatesAndPricesParams = Tuple[
+    List[str],  # Список валют
+    List[str],  # Список акций
+    Dict[str, Any],  # Ожидаемые курсы валют
+    Dict[str, Any],  # Ожидаемые цены на акции
+    List[int],  # Обновления прогресс-бара
+]
+
+
+def test_get_rates_and_prices(rates_and_prices_params: RatesAndPricesParams) -> None:
+    currencies, stocks, expected_currency_rates, expected_stock_prices, progress_updates = rates_and_prices_params
+    with patch("src.views.get_currency_rates", return_value=expected_currency_rates) as mock_get_currency_rates, patch(
+        "src.views.get_stock_prices", return_value=expected_stock_prices
+    ) as mock_get_stock_prices:
+        mock_progress_bar = MagicMock()
+
+        currency_rates, stock_prices = get_rates_and_prices(currencies, stocks, mock_progress_bar)
+
+        mock_get_currency_rates.assert_called_once_with(currencies)
+        mock_get_stock_prices.assert_called_once_with(stocks)
+        assert currency_rates == expected_currency_rates
+        assert stock_prices == expected_stock_prices
+
+        assert mock_progress_bar.update.call_count == len(progress_updates)
+        for update in progress_updates:
+            mock_progress_bar.update.assert_any_call(update)
+
+
+def test_get_user_settings_data() -> None:
+    mock_user_settings = {"user_currencies": ["USD", "EUR", "JPY"], "user_stocks": ["AAPL", "GOOGL", "TSLA"]}
+
+    expected_currencies = ["USD", "EUR", "JPY"]
+    expected_stocks = ["AAPL", "GOOGL", "TSLA"]
+
+    # Мокаем функцию load_user_settings
+    with patch("src.views.load_user_settings", return_value=mock_user_settings) as mock_load_user_settings:
+        mock_progress_bar: MagicMock = MagicMock(spec=tqdm)
+
+        # Вызов тестируемой функции
+        currencies, stocks = get_user_settings_data(mock_progress_bar)
+
+        # Проверка, что load_user_settings был вызван с правильным файлом
+        mock_load_user_settings.assert_called_once_with("user_settings.json")
+
+        # Проверка, что прогресс-бар был обновлен на 10
+        mock_progress_bar.update.assert_called_once_with(10)
+
+        # Проверка, что функция вернула правильные списки валют и акций
+        assert currencies == expected_currencies
+        assert stocks == expected_stocks
 
 
 def test_get_greeting() -> None:
@@ -152,3 +230,95 @@ def test_get_stock_prices() -> None:
         mock_get.assert_any_call(
             "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=GOOGL&apikey=fake_alpha_key"
         )
+
+
+@pytest.fixture
+def sample_df():
+    return pd.DataFrame(
+        {
+            "date": ["2023-01-01", "2023-01-02", "2023-01-03"],
+            "amount": [100, 200, 300],
+            "type": ["income", "expense", "income"],
+        }
+    )
+
+
+def test_main_func_home(sample_df):
+    with patch("src.views.get_greeting", return_value="Hello"), patch(
+        "src.views.process_home_data"
+    ) as mock_process_home_data:
+        mock_process_home_data.return_value = {
+            "cards": ["Card1", "Card2"],
+            "top_transactions": ["Transaction1", "Transaction2"],
+            "currency_rates": {"USD": 1.0},
+            "stock_prices": {"AAPL": 150.0},
+        }
+
+        result = main_func("home", "2023-01-01 00:00:00", sample_df)
+
+        assert isinstance(result, str)
+        data = json.loads(result)
+        assert data["greeting"] == "Hello"
+        assert "cards" in data
+        assert "top_transactions" in data
+        assert "currency_rates" in data
+        assert "stock_prices" in data
+
+
+def test_main_func_events(sample_df):
+    with patch("src.views.get_greeting", return_value="Hello"), patch(
+        "src.views.get_common_data", return_value=sample_df
+    ), patch("src.views.process_events_data") as mock_process_events_data:
+        mock_process_events_data.return_value = {
+            "expenses": [100, 200],
+            "income": [300],
+            "currency_rates": {"USD": 1.0},
+            "stock_prices": {"AAPL": 150.0},
+        }
+
+        result = main_func("events", "2023-01-01 00:00:00", sample_df)
+
+        assert isinstance(result, str)
+        data = json.loads(result)
+        assert data["greeting"] == "Hello"
+        assert "expenses" in data
+        assert "income" in data
+        assert "currency_rates" in data
+        assert "stock_prices" in data
+
+
+def test_main_func_no_data():
+    result = main_func("home", "2023-01-01 00:00:00", None)
+    assert isinstance(result, str)
+    data = json.loads(result)
+    assert data["error"] == "No data available."
+
+
+def test_process_home_data(sample_df):
+    with patch("src.views.get_card_from_main", return_value=["Card1", "Card2"]), patch(
+        "src.views.get_top_transactions", return_value=["Transaction1", "Transaction2"]
+    ), patch("src.views.get_user_settings_data", return_value=(["USD"], ["AAPL"])), patch(
+        "src.views.get_rates_and_prices", return_value=({"USD": 1.0}, {"AAPL": 150.0})
+    ):
+        pbar = MagicMock()
+        result = process_home_data(pbar, sample_df, pd.Timestamp("2023-01-01"), pd.Timestamp("2023-01-31"))
+
+        assert "cards" in result
+        assert "top_transactions" in result
+        assert "currency_rates" in result
+        assert "stock_prices" in result
+
+
+def test_process_events_data(sample_df):
+    with patch("src.views.get_expenses", return_value=[100, 200]), patch(
+        "src.views.get_income", return_value=[300]
+    ), patch("src.views.get_user_settings_data", return_value=(["USD"], ["AAPL"])), patch(
+        "src.views.get_rates_and_prices", return_value=({"USD": 1.0}, {"AAPL": 150.0})
+    ):
+        pbar = MagicMock()
+        result = process_events_data(pbar, sample_df)
+
+        assert "expenses" in result
+        assert "income" in result
+        assert "currency_rates" in result
+        assert "stock_prices" in result

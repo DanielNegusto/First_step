@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -6,9 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 load_dotenv()
-
 
 API_KEY = os.getenv("API")
 Alpha_KEY = os.getenv("AlPHA_API")
@@ -48,6 +49,59 @@ def get_greeting(current_time: datetime) -> str:
         return "Добрый вечер"
     else:
         return "Доброй ночи"
+
+
+def get_user_settings_data(progress_bar: tqdm) -> Tuple[List[str], List[str]]:
+    """
+    Загружает настройки пользователя и получает список валют и акций.
+
+    Args:
+        progress_bar (tqdm): Прогресс-бар для обновления хода выполнения операции.
+
+    Returns:
+        Tuple[List[str], List[str]]: Кортеж, содержащий два списка - пользовательские валюты и акции.
+    """
+    user_settings = load_user_settings("user_settings.json")
+    currencies = user_settings.get("user_currencies", [])
+    stocks = user_settings.get("user_stocks", [])
+    progress_bar.update(10)
+    return currencies, stocks
+
+
+def get_rates_and_prices(currencies: List[str], stocks: List[str], progress_bar: tqdm) -> Tuple[List[Any], List[Any]]:
+    """
+    Получает текущие курсы для указанных валют и цены на указанные акции.
+
+    Args:
+        currencies (List[str]): Список кодов валют.
+        stocks (List[str]): Список тикеров акций.
+        progress_bar (tqdm): Прогресс-бар для обновления хода выполнения операции.
+
+    Returns:
+        Tuple[List[Any], List[Any]]: Кортеж, содержащий два списка - курсы валют и цены акций.
+    """
+    currency_rates = get_currency_rates(currencies)
+    progress_bar.update(10)
+    stock_prices = get_stock_prices(stocks)
+    progress_bar.update(10)
+    return currency_rates, stock_prices
+
+
+def get_common_data(start_date: datetime, end_date: datetime, progress_bar: tqdm) -> Any:
+    """
+    Загружает данные о картах из Excel-файла в указанный диапазон дат.
+
+    Args:
+        start_date (datetime): Начальная дата для фильтрации данных.
+        end_date (datetime): Конечная дата для фильтрации данных.
+        progress_bar (tqdm): Прогресс-бар для обновления хода выполнения операции.
+
+    Returns:
+        Any: DataFrame, содержащий отфильтрованные данные о картах.
+    """
+    df = get_card_data_from_excel("data/operations.xls", start_date=start_date, end_date=end_date)
+    progress_bar.update(20)
+    return df
 
 
 def parse_date_range(date_str: str, date_range: Optional[str] = None) -> Tuple[datetime, datetime]:
@@ -262,3 +316,105 @@ def get_stock_prices(stocks: List[str]) -> List[Dict[str, Any]]:
             stock_price = data["Time Series (Daily)"][last_refreshed]["4. close"]
             stock_prices.append({"stock": stock, "price": float(stock_price)})
     return stock_prices
+
+
+def main_func(
+    data_type: str, date_str: str, df: Optional[pd.DataFrame] = None, date_range: Optional[str] = None
+) -> dict[Any, Any] | str:
+    """
+    Основная функция для обработки и возврата финансовых данных на основе указанного типа данных и даты.
+
+    Args:
+        data_type (str): Тип данных для получения ('home' или 'events').
+        date_str (str): Дата для обработки данных.
+        date_range (Optional[str]): Необязательный диапазон дат для фильтрации данных.
+        df (Optional[pd.DataFrame]): Необязательный DataFrame с данными.
+
+    Returns:
+        str: Строка в формате JSON, содержащая обработанные данные или сообщение об ошибке.
+    """
+    try:
+        current_time = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        greeting = get_greeting(current_time)
+
+
+        if df is None:
+            return json.dumps({"error": "No data available."}, ensure_ascii=False, indent=4)
+
+        dic_lst: Dict[str, Any] = {}
+
+        with tqdm(total=100, desc="Processing") as pbar:
+            if data_type == "home":
+                start_date = current_time.replace(day=1)
+                end_date = current_time
+
+                # Обработка данных для "home"
+                dic_lst["greeting"] = greeting
+                dic_lst.update(process_home_data(pbar, df, start_date, end_date))
+
+            elif data_type == "events":
+                start_date, end_date = parse_date_range(date_str, date_range)
+                df = get_common_data(start_date, end_date, pbar)
+                if df is None:
+                    return json.dumps({"error": "No data available."}, ensure_ascii=False, indent=4)
+
+                # Обработка данных для "events"
+                dic_lst["greeting"] = greeting
+                dic_lst.update(process_events_data(pbar, df))
+
+            else:
+                raise ValueError("Invalid data type. Must be 'home' or 'events'.")
+
+        return json.dumps(dic_lst, ensure_ascii=False, indent=4)
+
+    except Exception as e:
+        logging.error(f"Error occurred: {e}")
+        return json.dumps({"error": "An error occurred while processing the request."}, ensure_ascii=False, indent=4)
+
+
+def process_home_data(pbar: tqdm, df: pd.DataFrame, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+    """Обрабатывает данные для типа 'home'."""
+    pbar.set_description("Получение информации о картах")
+    card_data = get_card_from_main(df)
+    pbar.update(30)
+
+    pbar.set_description("Получение топовых транзакций")
+    top_transactions = get_top_transactions(start_date=start_date, end_date=end_date)
+    pbar.update(20)
+
+    currencies, stocks = get_user_settings_data(pbar)
+
+    pbar.set_description("Получение курсов валют и цен на акции")
+    currency_rates, stock_prices = get_rates_and_prices(currencies, stocks, pbar)
+    pbar.update(20)
+
+    return {
+        "cards": card_data,
+        "top_transactions": top_transactions,
+        "currency_rates": currency_rates,
+        "stock_prices": stock_prices,
+    }
+
+
+def process_events_data(pbar: tqdm, df: pd.DataFrame) -> Dict[str, Any]:
+    """Обрабатывает данные для типа 'events'."""
+    pbar.set_description("Получение расходов")
+    expenses = get_expenses(df)
+    pbar.update(10)
+
+    pbar.set_description("Получение доходов")
+    income = get_income(df)
+    pbar.update(10)
+
+    currencies, stocks = get_user_settings_data(pbar)
+
+    pbar.set_description("Получение курсов валют и цен на акции")
+    currency_rates, stock_prices = get_rates_and_prices(currencies, stocks, pbar)
+    pbar.update(10)
+
+    return {
+        "expenses": expenses,
+        "income": income,
+        "currency_rates": currency_rates,
+        "stock_prices": stock_prices,
+    }
