@@ -1,257 +1,153 @@
-import os
 import json
 import pprint
+from datetime import datetime
+from typing import List, Optional
 
-import requests
-from datetime import datetime, timedelta
-import logging
 import pandas as pd
-from dotenv import load_dotenv
+
+from src.reports import category_spending, spending_by_category
+from src.services import analyze_cashback, get_info_from_excel, investment_bank
+from src.utils import get_day_input, get_month_input, get_year_input, parse_user_date
+from src.views import get_card_data_from_excel, main_func
 
 
-load_dotenv()
-
-API_KEY = os.getenv('API')
-Alpha_KEY = os.getenv('AlPHA_API')
-
-
-# Загрузка пользовательских настроек
-def load_user_settings(filepath='user_settings.json'):
-    with open(filepath, 'r') as f:
-        return json.load(f)
+def get_user_input(prompt: str, valid_options: Optional[List[str]] = None) -> str:
+    while True:
+        user_input = input(prompt).strip().upper()
+        if valid_options and user_input not in valid_options:
+            print(f"Неверный ввод. Доступные опции: {', '.join(valid_options)}")
+        else:
+            return user_input
 
 
-def get_greeting(current_time):
-    hour = current_time.hour
-    if 6 <= hour < 12:
-        return "Доброе утро"
-    elif 12 <= hour < 18:
-        return "Добрый день"
-    elif 18 <= hour < 24:
-        return "Добрый вечер"
-    else:
-        return "Доброй ночи"
-
-
-def parse_date_range(date_str, date_range='M'):
-    current_time = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-    if date_range == 'W':
-        start_date = current_time - timedelta(days=current_time.weekday())
-    elif date_range == 'M':
-        start_date = current_time.replace(day=1)
-    elif date_range == 'Y':
-        start_date = current_time.replace(month=1, day=1)
-    elif date_range == 'ALL':
-        start_date = None
-    else:
-        start_date = current_time.replace(day=1)
-    end_date = current_time
-    return start_date, end_date
-
-
-# Получение данных по картам из Excel
-def get_card_data_from_excel(filepath='data/operations.xls', start_date=None, end_date=None):
-    df = pd.read_excel(filepath)
-    df['Дата операции'] = pd.to_datetime(df['Дата операции'], format='%d.%m.%Y %H:%M:%S', errors='coerce')
-    if start_date:
-        df = df[df['Дата операции'] >= start_date]
-    if end_date:
-        df = df[df['Дата операции'] <= end_date]
-
-    return df
-
-
-def get_card_from_main(df):
-    card_summary = df.groupby('Номер карты')['Сумма операции'].sum().reset_index()
-
-    card_info = []
-    for index, row in card_summary.iterrows():
-        last_digits = str(row['Номер карты'])[-4:]
-        total_spent = row['Сумма операции']
-        cashback = round(total_spent * 0.01, 2)
-        card_info.append({
-            "last_digits": last_digits,
-            "total_spent": total_spent,
-            "cashback": cashback
-        })
-
-    return card_info
-
-
-def get_expenses(df):
-    expenses = df[df['Сумма операции'] < 0]
-    total_amount = round(abs(expenses['Сумма операции'].sum()))
-    main_categories = expenses.groupby('Категория')['Сумма операции'].sum().abs().nlargest(7).reset_index()
-    other_amount = abs(expenses[~expenses['Категория'].isin(main_categories['Категория'])]['Сумма операции'].sum())
-    main_expenses = main_categories.to_dict('records')
-    if other_amount > 0:
-        main_expenses.append({"Категория": "Остальное", "Сумма операции": round(other_amount)})
-    transfers_and_cash = expenses[expenses['Категория'].isin(['Наличные', 'Переводы'])].groupby('Категория')['Сумма операции'].sum().abs().reset_index().to_dict('records')
-    return {
-        "total_amount": total_amount,
-        "main": [{"category": row['Категория'], "amount": round(row['Сумма операции'])} for row in main_expenses],
-        "transfers_and_cash": [{"category": row['Категория'], "amount": round(row['Сумма операции'])} for row in transfers_and_cash]
-    }
-
-
-def get_income(df):
-    income = df[df['Сумма операции'] > 0]
-    total_amount = round(income['Сумма операции'].sum())
-    main_categories = income.groupby('Категория')['Сумма операции'].sum().nlargest(7).reset_index()
-    main_income = main_categories.to_dict('records')
-    return {
-        "total_amount": total_amount,
-        "main": [{"category": row['Категория'], "amount": round(row['Сумма операции'])} for row in main_income]
-    }
-
-
-# Получение топ-5 транзакций из Excel
-def get_top_transactions(filepath='data/operations.xls', start_date=None, end_date=None):
-    df = pd.read_excel(filepath)
-    df['Дата операции'] = pd.to_datetime(df['Дата операции'], format='%d.%m.%Y %H:%M:%S', errors='coerce')
-    if start_date and end_date:
-        mask = (df['Дата операции'] >= start_date) & (df['Дата операции'] <= end_date)
-        df = df.loc[mask]
-
-    df = df.dropna(subset=['Дата операции'])
-    top_transactions = df.nlargest(5, 'Сумма операции').to_dict('records')
-
-    formatted_transactions = []
-    for transaction in top_transactions:
-        formatted_transactions.append({
-            "date": transaction['Дата операции'].strftime('%d.%m.%Y'),
-            "amount": transaction['Сумма операции'],
-            "category": transaction['Категория'],
-            "description": transaction['Описание']
-        })
-
-    return formatted_transactions
-
-
-# Получение курсов валют
-def get_currency_rates(currencies):
-    currency_rates = []
-    for currency in currencies:
-        url = 'https://api.apilayer.com/fixer/latest'
-        params = {
-            'base': currency
-        }
-        headers = {
-            'apikey': API_KEY
-        }
-
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            currency_rates.append({
-                "currency": currency,
-                "rate": data['rates'].get("RUB", "N/A")
-            })
-    return currency_rates
-
-
-# Получение стоимости акций
-def get_stock_prices(stocks):
-    stock_prices = []
-    for stock in stocks:
-        api_url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={stock}&apikey={API_KEY}"
-        response = requests.get(api_url)
-        if response.status_code == 200:
-            data = response.json()
-            last_refreshed = data['Meta Data']['3. Last Refreshed']
-            stock_price = data['Time Series (Daily)'][last_refreshed]['4. close']
-            stock_prices.append({
-                "stock": stock,
-                "price": float(stock_price)
-            })
-    return stock_prices
-
-
-def main(date_str):
-    try:
-        current_time = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-        greeting = get_greeting(current_time)
-
-        start_date = current_time.replace(day=1)
-        end_date = current_time
-
-        card_data = get_card_data_from_excel(start_date=start_date, end_date=end_date)
-        top_transactions = get_top_transactions(start_date=start_date, end_date=end_date)
-
-        # user_settings = load_user_settings()
-        # currencies = user_settings.get("user_currencies", [])
-        # stocks = user_settings.get("user_stocks", [])
-        #
-        # currency_rates = get_currency_rates(currencies)
-        # stock_prices = get_stock_prices(stocks)
-
-        dic_lst = {
-            "greeting": greeting,
-            "cards": card_data,
-            "top_transactions": top_transactions,
-            # "currency_rates": currency_rates,
-            # "stock_prices": stock_prices
-        }
-
-        return json.dumps(dic_lst, ensure_ascii=False, indent=4)
-
-    except Exception as e:
-        logging.error(f"Error occurred: {e}")
-        return json.dumps({"error": "An error occurred while processing the request."}, ensure_ascii=False, indent=4)
-
-
-# Главная функция
-def main_sub(date_str,  date_range='M'):
-    try:
-        current_time = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-        greeting = get_greeting(current_time)
-
-        start_date, end_date = parse_date_range(date_str, date_range)
-
-        df = get_card_data_from_excel(start_date=start_date, end_date=end_date)
-        expenses = get_expenses(df)
-        income = get_income(df)
-        # user_settings = load_user_settings()
-        # currencies = user_settings.get("user_currencies", [])
-        # stocks = user_settings.get("user_stocks", [])
-
-        # currency_rates = get_currency_rates(currencies)
-        # stock_prices = get_stock_prices(stocks)
-
-        dic_lst = {
-            "greeting": greeting,
-            "expenses": expenses,
-            "income": income,
-            # "currency_rates": currency_rates,
-            # "stock_prices": stock_prices
-        }
-
-        return json.dumps(dic_lst, ensure_ascii=False, indent=4)
-
-    except Exception as e:
-        logging.error(f"Error occurred: {e}")
-        return json.dumps({"error": "An error occurred while processing the request."}, ensure_ascii=False)
-
-
-def save_result_to_file(file, filename='result.json'):
-    with open(filename, 'w', encoding='utf-8') as f:
+def save_result_to_file(result: str, filename: str) -> None:
+    with open(filename, "w", encoding="utf-8") as f:
         f.write(result)
 
 
+def main() -> None:
+    print("Привет! Добро пожаловать в программу работы с банковскими данными.")
+    main_option = get_user_input(
+        "Выберите необходимый пункт меню:\n1. Веб-Страницы\n2. Сервисы\n3. Отчёты\nВведите номер: ", ["1", "2", "3"]
+    )
+
+    if main_option == "1":
+        handle_web_pages()
+    elif main_option == "2":
+        handle_services()
+    elif main_option == "3":
+        handle_reports()
+
+
+def handle_web_pages() -> None:
+    date_option = get_user_input("Выбрать текущую дату? (Да/Нет): ", ["ДА", "НЕТ"])
+    date_str = get_date_input(date_option)
+
+    current_time = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+    start_date = current_time.replace(day=1)
+    end_date = current_time
+
+    df = get_card_data_from_excel("data/operations.xls", start_date, end_date)
+    option = get_user_input(
+        "По какой странице вам нужна информация?\n1. Главная\n2. События\nВведите номер: ", ["1", "2"]
+    )
+
+    if option == "1":
+        handle_home_page(df, date_str)
+    elif option == "2":
+        handle_events_page(df, date_str)
+
+
+def get_date_input(date_option: str) -> str:
+    if date_option == "ДА":
+        return parse_user_date()
+    else:
+        year = get_year_input()
+        month = get_month_input()
+        day = get_day_input()
+        return parse_user_date(year, month, day)
+
+
+def handle_home_page(df: pd.DataFrame, date_str: str) -> None:
+    print("Получение информации по вашей дате...")
+    result = main_func("home", date_str, df)
+    process_result(result)
+
+
+def handle_events_page(df: pd.DataFrame, date_str: str) -> None:
+    print(
+        "W — неделя, на которую приходится дата\nM — месяц, на который приходится дата\n"
+        "Y — год, на который приходится дата\nALL — все данные до указанной даты"
+    )
+    date_range = get_user_input("Выберите диапазон данных: ", ["W", "M", "Y", "ALL"])
+    print("Получение информации по вашей дате и диапазону данных...")
+    result = main_func("events", date_str, df, date_range)
+    process_result(result)
+
+
+def handle_services() -> None:
+    print("Введите дату для анализа данных")
+    year = get_year_input()
+    month = get_month_input()
+    print("Получение данных карт")
+    option = get_user_input(
+        "Какие сервисы вы хотите использовать?\n1. Выгодные категории повышенного кешбэка\n"
+        "2. Инвесткопилка\nВведите номер: ",
+        ["1", "2"],
+    )
+
+    if option == "1":
+        analyze_cashback_service(year, month)
+    elif option == "2":
+        investment_service(year, month)
+
+
+def analyze_cashback_service(year: str, month: str) -> None:
+    print("Анализ выгодных категорий")
+    data = get_info_from_excel()
+    result = analyze_cashback(data, int(year), int(month))
+    process_result(result)
+
+
+def investment_service(year: str, month: str) -> None:
+    data = get_info_from_excel()
+    limit = get_user_input("Введите порог округления: ", ["10", "50", "100"])
+    month_str = f"{year}-{month}"
+    result = investment_bank(month_str, data, int(limit))
+    print(round(result, 2))
+
+
+def handle_reports() -> None:
+    print("Выбрано траты по категории")
+    data = get_info_from_excel()
+    df = pd.DataFrame(data)
+    df["Дата операции"] = pd.to_datetime(df["Дата операции"], dayfirst=True)
+    date_option = get_user_input("Выбрать текущую дату для анализа? (Да/Нет): ", ["ДА", "НЕТ"])
+
+    if date_option == "ДА":
+        found = category_spending(df)
+        result = spending_by_category(df, found)
+        print(result)
+    else:
+        print("Введите дату для анализа данных")
+        year = get_year_input()
+        month = get_month_input()
+        day = get_day_input()
+        date_str = f"{year}-{month}-{day}"
+        found = category_spending(df)
+        result = spending_by_category(df, found, date_str)
+        print(result)
+
+
+def process_result(result: str) -> None:
+    print("Информация получена")
+    file_option = get_user_input("Сохранить файл(Да/Нет): ", ["ДА", "НЕТ"])
+    if file_option == "ДА":
+        save_result_to_file(result, "data/result.json")
+        print("Полученные данные сохранены в 'result.json'")
+    print("Ваши данные по запросу -> ")
+    pprint.pp(json.loads(result))
+
+
 if __name__ == "__main__":
-    user_int = input("Введите 1/2: ")
-    if user_int == "2":
-        date_str = "2021-07-22 19:32:50"
-        date_range = 'M'  # Диапазон данных (может быть 'W', 'M', 'Y', 'ALL'), по умолчанию 'M'
-        result = main_sub(date_str, date_range)
-        pprint.pp(json.loads(result))
-        # save_result_to_file(result, 'result.json')
-    if user_int == "1":
-        date_str = "2021-07-22 19:32:50"
-        result = main(date_str)
-        pprint.pp(result)
-        # save_result_to_file(result, 'result.json')
-
-
-
-
+    main()
